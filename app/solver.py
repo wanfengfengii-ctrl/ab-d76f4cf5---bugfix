@@ -153,16 +153,12 @@ def parse_input(payload: object) -> tuple[int, list[Read]]:
             )
         )
 
-    # The optimizer tabulates costs in signed 64-bit integers; reject inputs
-    # whose theoretical maximum total cost could interfere with the DP's
-    # infinity sentinel (inf ~ 2**61, so path sums must stay far below it).
-    grand_total = sum(sum(r.costs) for r in reads)
-    if grand_total > (1 << 58):
-        raise PhaseError(
-            "INVALID_INPUT",
-            "sum of mismatch costs is too large to score exactly; costs must be "
-            "small positive integers (aggregate cost must fit in 59 bits)",
-        )
+    # Per-position costs are arbitrary positive Python ints: there is no
+    # upper bound in the input contract, and costs attached to mismatches on
+    # paths the optimum never takes are irrelevant to the result.  The
+    # optimizer keeps a vectorized int64 fast path while per-edge and total
+    # costs stay below a safe bound, and switches to exact arbitrary-precision
+    # scoring otherwise.
 
     # Every read is a contiguous interval by construction.  Across reads the
     # union must tile the full locus: an uncovered site cannot be phased and
@@ -184,6 +180,54 @@ def parse_input(payload: object) -> tuple[int, list[Read]]:
 # ----- candidate tables -----------------------------------------------------
 
 
+# Per-read span totals larger than this bound cannot be scored exactly in
+# signed 64-bit numpy arithmetic; such instances are tabulated with
+# arbitrary-precision Python ints instead (object arrays).
+INT64_EDGE_LIMIT = np.iinfo(np.int64).max // 4
+
+
+class _ExactInfinity:
+    """Largest element sentinel for object-dtype exact integer DP arrays.
+
+    Behaves like +infinity under addition and total ordering so the same
+    vectorized DP code works with arbitrary-precision Python ints; it never
+    compares equal to any finite target cost.
+    """
+
+    _instance: "_ExactInfinity | None" = None
+
+    def __new__(cls) -> "_ExactInfinity":
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __add__(self, other):
+        return self
+
+    __radd__ = __add__
+
+    def __lt__(self, other) -> bool:
+        return False
+
+    def __gt__(self, other) -> bool:
+        return not isinstance(other, _ExactInfinity)
+
+    def __le__(self, other) -> bool:
+        return isinstance(other, _ExactInfinity)
+
+    def __ge__(self, other) -> bool:
+        return True
+
+    def __eq__(self, other) -> bool:
+        return isinstance(other, _ExactInfinity)
+
+    def __hash__(self) -> int:
+        return hash("exact-infinity-sentinel")
+
+
+EXACT_INF = _ExactInfinity()
+
+
 def candidate_tables(n_sites: int, reads: list[Read]):
     """Per-candidate mismatch / cost / feasibility tables.
 
@@ -193,17 +237,28 @@ def candidate_tables(n_sites: int, reads: list[Read]):
 
     * ``mm0``   uint8 mismatches vs the canonical haplotype (group 0)
     * ``mm1``   uint8 mismatches vs the complement (group 1)
-    * ``cost0`` int64 mismatch cost vs the canonical haplotype
-    * ``cost1`` int64 mismatch cost vs the complement
+    * ``cost0`` per-read mismatch cost vs the canonical haplotype
+    * ``cost1`` per-read mismatch cost vs the complement
     * ``feas0`` bool  group-0 assignment respects the mismatch allowance
     * ``feas1`` bool  group-1 assignment respects the mismatch allowance
+
+    Cost arrays are ``int64`` while every read's full-span cost fits below
+    ``INT64_EDGE_LIMIT``; otherwise they are object arrays of exact Python
+    ints, so arbitrarily large positive costs never lose precision.
     """
     m = len(reads)
     n_bits = n_sites - 1
     c_count = 1 << n_bits
 
+    span_totals = [sum(r.costs) for r in reads]
+    grand_total = sum(span_totals)
+    # Exact mode is needed when a single edge or any reachable path sum could
+    # overflow signed 64-bit scoring; the rising-cap DP prunes every partial
+    # sum above the optimum, which never exceeds the grand total.
+    big = max(span_totals) > INT64_EDGE_LIMIT or grand_total > INT64_EDGE_LIMIT
+
     mm0 = np.zeros((c_count, m), dtype=np.uint8)
-    cost0 = np.zeros((c_count, m), dtype=np.int64)
+    cost0 = np.zeros((c_count, m), dtype=object if big else np.int64)
 
     idx = np.arange(c_count, dtype=np.int64)
     site_cols: list[np.ndarray] = [np.zeros(c_count, dtype=np.uint8)]
@@ -213,18 +268,57 @@ def candidate_tables(n_sites: int, reads: list[Read]):
     for j, r in enumerate(reads):
         span = r.end - r.start
         obs = np.asarray(r.obs, dtype=np.uint8)
-        costs = np.asarray(r.costs, dtype=np.int64)
         mis = np.empty((span, c_count), dtype=np.uint8)
         for k, site in enumerate(range(r.start, r.end)):
             np.bitwise_xor(obs[k], site_cols[site], out=mis[k])
         mm0[:, j] = mis.sum(axis=0)
-        cost0[:, j] = costs @ mis
+        if not big or span_totals[j] <= INT64_EDGE_LIMIT:
+            # vectorized exact int64 scoring for this read's span
+            col = np.asarray(r.costs, dtype=np.int64) @ mis
+            if big:
+                cost0[:, j] = col.tolist()
+            else:
+                cost0[:, j] = col
+        else:
+            # Hybrid exact scoring: positions whose individual cost fits in
+            # the int64 edge budget are scored in vectorized int64 batches
+            # (each batch's weight sum also stays within the budget); only
+            # genuinely huge positions fall back to arbitrary-precision
+            # Python-int updates over the mismatching candidates.
+            col = np.zeros(c_count, dtype=object)
+            batches: list[list[tuple[int, int]]] = [[]]
+            batch_sum = 0
+            for k in range(span):
+                w = r.costs[k]
+                if w <= INT64_EDGE_LIMIT:
+                    if batches[-1] and batch_sum + w > INT64_EDGE_LIMIT:
+                        batches.append([])
+                        batch_sum = 0
+                    batches[-1].append((k, w))
+                    batch_sum += w
+            for batch in batches:
+                partial = np.zeros(c_count, dtype=np.int64)
+                for k, w in batch:
+                    partial += w * mis[k].astype(np.int64)
+                # cast before adding so every stored value stays a plain
+                # arbitrary-precision Python int
+                col = col + partial.astype(object)
+            for k in range(span):
+                w = r.costs[k]
+                if w > INT64_EDGE_LIMIT:
+                    mask = mis[k].astype(bool)
+                    col[mask] = [v + w for v in col[mask]]
+            cost0[:, j] = col
 
     allow = np.asarray([r.max_mismatches for r in reads], dtype=np.uint8)
     spans = np.asarray([r.end - r.start for r in reads], dtype=np.uint8)
-    span_cost = np.asarray([sum(r.costs) for r in reads], dtype=np.int64)
+    # cost1 = span_total - cost0; broadcast subtraction stays exact on object
+    # arrays (Python ints) and int64 on the fast path.
+    span_cost = np.asarray(
+        [span_totals], dtype=object if big else np.int64
+    )
+    cost1 = span_cost - cost0
     mm1 = spans[None, :].astype(np.uint8) - mm0
-    cost1 = span_cost[None, :] - cost0
     feas0 = mm0 <= allow[None, :]
     feas1 = mm1 <= allow[None, :]
     return mm0, mm1, cost0, cost1, feas0, feas1
@@ -346,7 +440,13 @@ def feasible_under_cap(
     ``[2, n-2]`` attains ``target_cost``.
     """
     n = mm0.shape[1]
-    inf = np.int64(np.iinfo(np.int64).max // 4)
+    big = cost0.dtype == object
+    # In int64 mode every reachable partial cost is at most the grand total of
+    # all costs (<= INT64_EDGE_LIMIT); the sentinel must tolerate one more
+    # edge addition without overflowing, so it stays strictly below int64 max
+    # minus the edge bound while above every finite value.
+    inf = EXACT_INF if big else np.int64((INT64_EDGE_LIMIT * 5) // 2)
+    dtype = object if big else np.int64
     winners: list[int] = []
 
     for start in range(0, len(candidate_ids), chunk):
@@ -357,10 +457,10 @@ def feasible_under_cap(
         a0 = feas0[ids] & (mm0[ids] <= cap)
         a1 = feas1[ids] & (mm1[ids] <= cap)
 
-        work = np.full((t, n + 1), inf, dtype=np.int64)
+        work = np.full((t, n + 1), inf, dtype=dtype)
         work[:, 0] = 0
         for i in range(n):
-            nxt = np.full((t, n + 1), inf, dtype=np.int64)
+            nxt = np.full((t, n + 1), inf, dtype=dtype)
             can0 = a0[:, i]
             can1 = a1[:, i]
             if np.any(can0):
@@ -371,7 +471,13 @@ def feasible_under_cap(
                 rows1 = np.where(can1)[0]
                 add1 = work + c1v[:, i : i + 1]
                 nxt[rows1, :] = np.minimum(nxt[rows1, :], add1[rows1])
+            # Costs are positive: any state already above the target can never
+            # return to it, so prune (also keeps exact-mode bignums from
+            # growing and int64-mode sums below the sentinel invariant).
+            nxt[nxt > target_cost] = inf
             work = nxt
+        # In exact mode unreachable states hold EXACT_INF, which never equals
+        # a finite target, so the same equality test applies to both modes.
         ok = (work[:, 2 : n - 1] == target_cost).any(axis=1)
         winners.extend(int(candidate_ids[start + k]) for k in np.where(ok)[0])
     return winners

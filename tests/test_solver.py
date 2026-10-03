@@ -188,6 +188,92 @@ def test_higher_cost_does_not_buy_lower_max():
 
 
 # --------------------------------------------------------------------------
+# arbitrary-precision costs (no fixed-width integer cap)
+# --------------------------------------------------------------------------
+
+
+def test_huge_cost_on_never_taken_path_does_not_reject():
+    """A giant cost at a position the optimum never mismatches at is benign.
+
+    Every read is damage-free with max_mismatches=0; read a0's cost at site 0
+    can only be paid by a haplotype starting with 1, which canonicalization
+    forbids.  The request must still solve uniquely at total cost 0.
+    """
+    n_sites, reads, hap = clean_instance()
+    reads[0]["mismatch_costs"][0] = 2**80
+    out = phase({"n_sites": n_sites, "reads": reads})
+    assert out["unique"] is True
+    sol = out["solution"]
+    assert sol["haplotype"] == hap == [0, 1, 1, 0, 1, 0, 0, 1]
+    assert sol["total_mismatch_cost"] == 0
+    assert sol["max_per_read_mismatches"] == 0
+
+
+@pytest.mark.parametrize("big_cost", [2**63, 2**64, 2**80, 2**1000])
+def test_optimum_with_cost_beyond_fixed_width_scored_exactly(big_cost):
+    """A mandatory mismatch at a giant cost is scored without approximation.
+
+    Read a0 is forced to the haplotype side (the complement side needs two
+    mismatches but the allowance is one), so the giant cost MUST appear in
+    the optimum; its value must be exact even past 64-bit range.
+    """
+    n_sites, reads, hap = clean_instance()
+    reads[0]["observations"][0] ^= 1
+    reads[0]["mismatch_costs"] = [big_cost, 1, 1]
+    reads[0]["max_mismatches"] = 1
+    out = phase({"n_sites": n_sites, "reads": reads})
+    assert out["unique"] is True
+    sol = out["solution"]
+    assert sol["haplotype"] == hap
+    assert sol["total_mismatch_cost"] == big_cost
+    by_id = {row["id"]: row for row in sol["per_read"]}
+    assert by_id["a0"]["mismatch_count"] == 1
+    assert by_id["a0"]["mismatch_cost"] == big_cost
+    assert by_id["a0"]["mismatch_positions"] == [0]
+
+
+def test_sum_of_huge_costs_is_exact():
+    """Two mandatory giant costs must add with arbitrary precision."""
+    n_sites, reads, hap = clean_instance()
+    reads[0]["observations"][0] ^= 1
+    reads[0]["mismatch_costs"] = [2**80, 1, 1]
+    reads[0]["max_mismatches"] = 1
+    reads[1]["observations"][-1] ^= 1  # a1 spans [2,5): last is global site 4
+    reads[1]["mismatch_costs"] = [1, 1, 2**80]
+    reads[1]["max_mismatches"] = 1
+    out = phase({"n_sites": n_sites, "reads": reads})
+    assert out["solution"]["total_mismatch_cost"] == 2**81
+
+
+def test_huge_cost_keeps_ambiguity_decision_stable():
+    """A dormant huge cost must not change the two-way tie semantics."""
+    n_sites = 8
+    reads = []
+    a_specs = [
+        ("a0", 0, 2, [0, 0]),
+        ("a1", 1, 4, [0, 1, 1]),
+        ("a2", 0, 3, [0, 0, 1]),
+        ("a3", 2, 4, [0, 0]),
+        ("a4", 0, 2, [1, 1]),
+    ]
+    b_specs = [
+        ("b0", 4, 6, [0, 0]),
+        ("b1", 5, 8, [0, 1, 1]),
+        ("b2", 4, 7, [0, 0, 1]),
+        ("b3", 6, 8, [0, 0]),
+        ("b4", 4, 6, [1, 1]),
+    ]
+    for rid, s, e, obs in a_specs + b_specs:
+        reads.append(make_read(rid, s, e, obs, allow=0))
+    # neither zero-cost solution mismatches at a0's site 0
+    d0 = next(r for r in reads if r["id"] == "a0")
+    d0["mismatch_costs"][0] = 2**120
+    out = phase({"n_sites": n_sites, "reads": reads})
+    assert out["unique"] is False
+    assert [s["total_mismatch_cost"] for s in out["solutions"]] == [0, 0]
+
+
+# --------------------------------------------------------------------------
 # ambiguity
 # --------------------------------------------------------------------------
 
@@ -368,3 +454,63 @@ def test_matches_brute_force_random(seed):
         assert len(out["solutions"]) == 2
     else:
         assert len(out["solutions"]) == 1
+
+
+def random_bigint_instance(n_sites, m, seed):
+    """Covering read set with arbitrary-magnitude (beyond-int64) costs."""
+    rng = random.Random(seed)
+    hap = [rng.randrange(2) for _ in range(n_sites)]
+    comp = [1 - b for b in hap]
+    big_pool = [2**64, 2**80, 2**100, 10**40]
+
+    for _attempt in range(200):
+        reads = []
+        for j in range(m):
+            length = rng.randint(2, min(5, n_sites))
+            start = rng.randint(0, n_sites - length)
+            src = hap if rng.randrange(2) == 0 else comp
+            obs = list(src[start : start + length])
+            flips = 0
+            for k in range(length):
+                if rng.random() < 0.2:
+                    obs[k] ^= 1
+                    flips += 1
+            costs = []
+            for _ in range(length):
+                roll = rng.random()
+                if roll < 0.15:
+                    costs.append(rng.choice(big_pool))
+                elif roll < 0.3:
+                    costs.append(rng.randint(10**6, 10**12))
+                else:
+                    costs.append(rng.randint(1, 9))
+            allow = rng.choice([0, flips, flips, min(flips + 1, length), length])
+            reads.append(make_read(f"r{j}", start, start + length, obs, costs, allow))
+        covered = [False] * n_sites
+        for r in reads:
+            for s in range(r["start"], r["end"]):
+                covered[s] = True
+        if all(covered):
+            return n_sites, reads
+    raise AssertionError("could not generate a covering instance")
+
+
+@pytest.mark.parametrize("seed", range(12))
+def test_matches_brute_force_bigint_costs(seed):
+    n_sites, reads = random_bigint_instance(8, 10, seed)
+    expected = brute_force(n_sites, reads)
+    n_sites_p, parsed = parse_input({"n_sites": n_sites, "reads": reads})
+    got = enumerate_solutions(n_sites_p, parsed)
+
+    if not expected:
+        assert got == []
+        return
+
+    for k, sol in enumerate(got):
+        exp = expected[k]
+        assert sol.haplotype == exp[2]
+        assert sol.assignments == exp[3]
+        assert sol.total_cost == exp[0]  # exact, never approximated
+
+    out = phase({"n_sites": n_sites, "reads": reads})
+    assert out["unique"] is (len(expected) == 1)

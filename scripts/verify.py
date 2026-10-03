@@ -78,6 +78,45 @@ def mismatch_sample():
     return {"n_sites": 8, "reads": reads}
 
 
+def clean_hap_comp():
+    hap = [0, 1, 1, 0, 1, 0, 0, 1]
+    return hap, [1 - b for b in hap]
+
+
+def huge_dormant_cost_sample():
+    """Clean instance with a dormant 2**80 cost: unique zero-cost phasing."""
+    hap, comp = clean_hap_comp()
+    spans0 = [(0, 3), (2, 5), (4, 7), (1, 4), (5, 8)]
+    spans1 = [(0, 2), (3, 6), (6, 8), (2, 4), (4, 8)]
+    reads = []
+    for i, (s, e) in enumerate(spans0):
+        reads.append(make_read(f"a{i}", s, e, hap[s:e], allow=0))
+    for i, (s, e) in enumerate(spans1):
+        reads.append(make_read(f"b{i}", s, e, comp[s:e], allow=0))
+    # cost only payable by a haplotype starting with 1 (canonicalization
+    # forbids it), so the optimum never incurs it
+    reads[0]["mismatch_costs"][0] = 2**80
+    return {"n_sites": 8, "reads": reads}
+
+
+def huge_mandatory_cost_sample():
+    """Mandatory mismatch priced at 2**80, which must appear in the optimum."""
+    hap, comp = clean_hap_comp()
+    spans0 = [(0, 3), (2, 5), (4, 7), (1, 4), (5, 8)]
+    spans1 = [(0, 2), (3, 6), (6, 8), (2, 4), (4, 8)]
+    reads = []
+    for i, (s, e) in enumerate(spans0):
+        reads.append(make_read(f"a{i}", s, e, hap[s:e], allow=0))
+    for i, (s, e) in enumerate(spans1):
+        reads.append(make_read(f"b{i}", s, e, comp[s:e], allow=0))
+    # a0 damaged at site 0: haplotype side costs one mismatch (allowance 1),
+    # complement side needs two mismatches and is infeasible at allowance 1
+    reads[0]["observations"][0] ^= 1
+    reads[0]["mismatch_costs"] = [2**80, 1, 1]
+    reads[0]["max_mismatches"] = 1
+    return {"n_sites": 8, "reads": reads}
+
+
 def ambiguous_sample():
     """Two unlinked blocks -> two distinct zero-cost canonical solutions."""
     specs = [
@@ -245,8 +284,35 @@ def smoke() -> list[str]:
         check(status == 422, f"status {status}")
         check(body["error"]["code"] == "INVALID_INPUT", f"body {body}")
 
+    def case_huge_dormant_cost():
+        status, body = request("POST", "/api/phase", huge_dormant_cost_sample())
+        check(status == 200, f"status {status}, body {body}")
+        data = body["data"]
+        check(data["unique"] is True, "should be uniquely solvable")
+        sol = data["solution"]
+        check(sol["haplotype"] == [0, 1, 1, 0, 1, 0, 0, 1], "canonical haplotype")
+        check(sol["total_mismatch_cost"] == 0, f"total cost {sol['total_mismatch_cost']} != 0")
+        check(sol["max_per_read_mismatches"] == 0, "max per-read mismatches != 0")
+
+    def case_huge_mandatory_cost():
+        status, body = request("POST", "/api/phase", huge_mandatory_cost_sample())
+        check(status == 200, f"status {status}, body {body}")
+        data = body["data"]
+        check(data["unique"] is True, "should be uniquely solvable")
+        sol = data["solution"]
+        check(sol["haplotype"] == [0, 1, 1, 0, 1, 0, 0, 1], "canonical haplotype")
+        check(
+            sol["total_mismatch_cost"] == 2**80,
+            f"total cost {sol['total_mismatch_cost']} != 2**80",
+        )
+        by_id = {r["id"]: r for r in sol["per_read"]}
+        check(by_id["a0"]["mismatch_cost"] == 2**80, "a0 exact giant cost")
+        check(by_id["a0"]["mismatch_positions"] == [0], "a0 mismatch positions")
+
     run("mismatch sample (unique, exact evidence)", case_mismatch)
     run("ambiguous sample (two tied solutions)", case_ambiguous)
+    run("huge dormant cost (unique zero-cost)", case_huge_dormant_cost)
+    run("huge mandatory cost (exact beyond int64)", case_huge_mandatory_cost)
     run("no-solution business error", case_no_solution)
     run("discontinuous-coverage business error", case_discontinuous)
     run("invalid input rejected", case_invalid)

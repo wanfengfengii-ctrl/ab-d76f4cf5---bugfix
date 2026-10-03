@@ -114,6 +114,31 @@ def test_bad_json_400():
     assert r.json()["error"]["code"] == "BAD_JSON"
 
 
+def test_phase_accepts_arbitrary_precision_cost():
+    """A huge dormant cost must not reject an otherwise clean instance."""
+    payload = clean_payload()
+    payload["reads"][0]["mismatch_costs"][0] = 2**80
+    r = client.post("/api/phase", json=payload)
+    assert r.status_code == 200, r.text
+    data = r.json()["data"]
+    assert data["unique"] is True
+    sol = data["solution"]
+    assert sol["haplotype"] == [0, 1, 1, 0, 1, 0, 0, 1]
+    assert sol["total_mismatch_cost"] == 0
+
+
+def test_phase_scores_mandatory_huge_cost_exactly():
+    """A mandatory mismatch priced past 64-bit range is scored exactly."""
+    payload = clean_payload()
+    payload["reads"][0]["observations"][0] ^= 1
+    payload["reads"][0]["mismatch_costs"] = [2**80, 1, 1]
+    payload["reads"][0]["max_mismatches"] = 1
+    r = client.post("/api/phase", json=payload)
+    assert r.status_code == 200, r.text
+    sol = r.json()["data"]["solution"]
+    assert sol["total_mismatch_cost"] == 2**80
+
+
 def test_ambiguous_payload_reports_two_solutions():
     reads = []
     a_specs = [
