@@ -188,6 +188,87 @@ def test_higher_cost_does_not_buy_lower_max():
 
 
 # --------------------------------------------------------------------------
+# arbitrary-precision mismatch costs
+# --------------------------------------------------------------------------
+
+
+def test_huge_cost_on_unused_path_does_not_invalidate_request():
+    """A legal per-position cost has no upper bound; if its mismatch can
+    never occur in the optimum it must not change the result at all."""
+    n_sites, reads, hap = clean_instance()
+    huge = 1 << 80
+    # read a0 matches the canonical haplotype exactly, so site 0 (and every
+    # other site) mismatches nowhere on its optimal assignment
+    assert reads[0]["observations"] == hap[0:3]
+    reads[0]["mismatch_costs"][0] = huge
+
+    n_sites_p, parsed = parse_input({"n_sites": n_sites, "reads": reads})
+    assert n_sites_p == n_sites and len(parsed) == len(reads)
+
+    out = phase({"n_sites": n_sites, "reads": reads})
+    assert out["unique"] is True
+    sol = out["solution"]
+    assert sol["haplotype"] == hap
+    assert sol["total_mismatch_cost"] == 0
+    assert sol["max_per_read_mismatches"] == 0
+    by_id = {r["id"]: r for r in sol["per_read"]}
+    assert by_id["a0"]["mismatch_count"] == 0
+    assert by_id["a0"]["mismatch_cost"] == 0
+    assert by_id["a0"]["mismatch_positions"] == []
+
+
+def test_optimal_total_cost_beyond_fixed_width_integers_is_exact():
+    """The optimum may itself carry a cost beyond uint64/int64 range."""
+    n_sites, reads, hap = clean_instance()
+    huge = 1 << 80
+    # force exactly one mismatch on read a0, priced beyond 64-bit range
+    reads[0]["observations"][0] ^= 1
+    reads[0]["mismatch_costs"] = [huge, 1, 1]
+    reads[0]["max_mismatches"] = 1
+
+    out = phase({"n_sites": n_sites, "reads": reads})
+    assert out["unique"] is True
+    sol = out["solution"]
+    assert sol["haplotype"] == hap
+    assert sol["total_mismatch_cost"] == huge
+    assert sol["total_mismatch_cost"] > 1 << 64
+    assert sol["max_per_read_mismatches"] == 1
+    by_id = {r["id"]: r for r in sol["per_read"]}
+    assert by_id["a0"] == {
+        "id": "a0",
+        "group": 0,
+        "mismatch_count": 1,
+        "mismatch_cost": huge,
+        "mismatch_positions": [0],
+    }
+    assert sum(r["mismatch_cost"] for r in sol["per_read"]) == huge
+
+
+def test_huge_costs_match_brute_force():
+    """Exact (cost, max-mm, haplotype, assignment) optimum with big ints."""
+    n_sites, reads, _ = clean_instance()
+    huge = 1 << 100
+    # force exactly one mismatch on read a0 and price it beyond 64 bits, so
+    # the optimal total cost itself is beyond any fixed-width integer
+    reads[0]["observations"][0] ^= 1
+    reads[0]["mismatch_costs"] = [huge, 1, 1]
+    reads[0]["max_mismatches"] = 1
+
+    expected = brute_force(n_sites, reads)
+    n_sites_p, parsed = parse_input({"n_sites": n_sites, "reads": reads})
+    got = enumerate_solutions(n_sites_p, parsed)
+
+    assert expected and expected[0][0] == huge
+    assert len(got) == 1
+    sol, exp = got[0], expected[0]
+    assert sol.haplotype == exp[2]
+    assert sol.assignments == exp[3]
+    assert sol.total_cost == exp[0] == huge
+    assert sol.max_mismatches == exp[1] == 1
+
+
+
+# --------------------------------------------------------------------------
 # ambiguity
 # --------------------------------------------------------------------------
 

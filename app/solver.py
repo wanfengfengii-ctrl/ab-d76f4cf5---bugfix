@@ -153,16 +153,9 @@ def parse_input(payload: object) -> tuple[int, list[Read]]:
             )
         )
 
-    # The optimizer tabulates costs in signed 64-bit integers; reject inputs
-    # whose theoretical maximum total cost could interfere with the DP's
-    # infinity sentinel (inf ~ 2**61, so path sums must stay far below it).
-    grand_total = sum(sum(r.costs) for r in reads)
-    if grand_total > (1 << 58):
-        raise PhaseError(
-            "INVALID_INPUT",
-            "sum of mismatch costs is too large to score exactly; costs must be "
-            "small positive integers (aggregate cost must fit in 59 bits)",
-        )
+    # Per-position costs carry no upper bound: the optimizer scores them with
+    # arbitrary-precision integers (switching its numpy tables to Python-object
+    # dtype when the aggregate exceeds the int64 fast-path range).
 
     # Every read is a contiguous interval by construction.  Across reads the
     # union must tile the full locus: an uncovered site cannot be phased and
@@ -193,8 +186,10 @@ def candidate_tables(n_sites: int, reads: list[Read]):
 
     * ``mm0``   uint8 mismatches vs the canonical haplotype (group 0)
     * ``mm1``   uint8 mismatches vs the complement (group 1)
-    * ``cost0`` int64 mismatch cost vs the canonical haplotype
-    * ``cost1`` int64 mismatch cost vs the complement
+    * ``cost0`` mismatch cost vs the canonical haplotype (int64 when the
+      aggregate of every listed cost fits safely in 64 bits, otherwise
+      Python-object integers of arbitrary precision)
+    * ``cost1`` mismatch cost vs the complement
     * ``feas0`` bool  group-0 assignment respects the mismatch allowance
     * ``feas1`` bool  group-1 assignment respects the mismatch allowance
     """
@@ -202,8 +197,17 @@ def candidate_tables(n_sites: int, reads: list[Read]):
     n_bits = n_sites - 1
     c_count = 1 << n_bits
 
+    # Keep the fast int64 vectorized path whenever every attainable path sum
+    # stays strictly below the capped DP's unreachable sentinel
+    # (int64.max // 4 == 2**61 - 1) and the sentinel plus one edge cost
+    # cannot overflow int64; an aggregate below 2**61 satisfies both.  Beyond
+    # that, numpy object arrays compute with arbitrary-precision Python ints.
+    grand_total = sum(sum(r.costs) for r in reads)
+    int64_safe = grand_total < (1 << 61) - 1
+    cost_dtype = np.int64 if int64_safe else object
+
     mm0 = np.zeros((c_count, m), dtype=np.uint8)
-    cost0 = np.zeros((c_count, m), dtype=np.int64)
+    cost0 = np.zeros((c_count, m), dtype=cost_dtype)
 
     idx = np.arange(c_count, dtype=np.int64)
     site_cols: list[np.ndarray] = [np.zeros(c_count, dtype=np.uint8)]
@@ -213,7 +217,7 @@ def candidate_tables(n_sites: int, reads: list[Read]):
     for j, r in enumerate(reads):
         span = r.end - r.start
         obs = np.asarray(r.obs, dtype=np.uint8)
-        costs = np.asarray(r.costs, dtype=np.int64)
+        costs = np.asarray(r.costs, dtype=cost_dtype)
         mis = np.empty((span, c_count), dtype=np.uint8)
         for k, site in enumerate(range(r.start, r.end)):
             np.bitwise_xor(obs[k], site_cols[site], out=mis[k])
@@ -222,7 +226,7 @@ def candidate_tables(n_sites: int, reads: list[Read]):
 
     allow = np.asarray([r.max_mismatches for r in reads], dtype=np.uint8)
     spans = np.asarray([r.end - r.start for r in reads], dtype=np.uint8)
-    span_cost = np.asarray([sum(r.costs) for r in reads], dtype=np.int64)
+    span_cost = np.asarray([sum(r.costs) for r in reads], dtype=cost_dtype)
     mm1 = spans[None, :].astype(np.uint8) - mm0
     cost1 = span_cost[None, :] - cost0
     feas0 = mm0 <= allow[None, :]
@@ -346,7 +350,18 @@ def feasible_under_cap(
     ``[2, n-2]`` attains ``target_cost``.
     """
     n = mm0.shape[1]
-    inf = np.int64(np.iinfo(np.int64).max // 4)
+    # The unreachable sentinel only has to exceed every attainable path sum.
+    # Any feasible path picks one side per read, and c0 + c1 equals that read's
+    # full span cost, so the aggregate span cost (row 0 suffices -- it is
+    # candidate-independent) is a universal upper bound.  Int64 tables stay
+    # below 2**61 where the fixed sentinel is safe; object tables carry an
+    # arbitrary-precision sentinel instead.
+    grand_total = int((cost0[0] + cost1[0]).sum())
+    cost_dtype = cost0.dtype
+    if cost_dtype == np.int64:
+        inf = np.int64(np.iinfo(np.int64).max // 4)
+    else:
+        inf = grand_total + 1
     winners: list[int] = []
 
     for start in range(0, len(candidate_ids), chunk):
@@ -357,10 +372,10 @@ def feasible_under_cap(
         a0 = feas0[ids] & (mm0[ids] <= cap)
         a1 = feas1[ids] & (mm1[ids] <= cap)
 
-        work = np.full((t, n + 1), inf, dtype=np.int64)
+        work = np.full((t, n + 1), inf, dtype=cost_dtype)
         work[:, 0] = 0
         for i in range(n):
-            nxt = np.full((t, n + 1), inf, dtype=np.int64)
+            nxt = np.full((t, n + 1), inf, dtype=cost_dtype)
             can0 = a0[:, i]
             can1 = a1[:, i]
             if np.any(can0):

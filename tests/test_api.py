@@ -138,3 +138,31 @@ def test_ambiguous_payload_reports_two_solutions():
     assert body["data"]["unique"] is False
     assert len(body["data"]["solutions"]) == 2
     assert body["data"]["note"]
+
+
+def test_huge_unused_cost_still_returns_unique_solution():
+    """A 2**80 cost on a never-mismatching position must not 422."""
+    payload = clean_payload()
+    assert payload["reads"][0]["observations"] == [0, 1, 1]
+    payload["reads"][0]["mismatch_costs"][0] = 1 << 80
+    r = client.post("/api/phase", json=payload)
+    assert r.status_code == 200, r.content
+    data = r.json()["data"]
+    assert data["unique"] is True
+    assert data["solution"]["haplotype"] == [0, 1, 1, 0, 1, 0, 0, 1]
+    assert data["solution"]["total_mismatch_cost"] == 0
+
+
+def test_optimal_cost_beyond_64_bits_is_scored_exactly():
+    payload = clean_payload()
+    huge = 1 << 80
+    payload["reads"][0]["observations"][0] ^= 1
+    payload["reads"][0]["mismatch_costs"] = [huge, 1, 1]
+    payload["reads"][0]["max_mismatches"] = 1
+    r = client.post("/api/phase", json=payload)
+    assert r.status_code == 200, r.content
+    sol = r.json()["data"]["solution"]
+    assert sol["haplotype"] == [0, 1, 1, 0, 1, 0, 0, 1]
+    assert sol["total_mismatch_cost"] == huge
+    assert sol["total_mismatch_cost"] > 1 << 64
+    assert sol["per_read"][0]["mismatch_cost"] == huge

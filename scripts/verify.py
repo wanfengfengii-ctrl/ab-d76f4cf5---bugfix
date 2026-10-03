@@ -115,6 +115,37 @@ def discontinuous_sample():
     }
 
 
+def huge_unused_cost_sample():
+    """Unique zero-cost phasing with a 2**80 price that is never incurred."""
+    payload = mismatch_sample()
+    # restore read a0 to a clean haplotype observation (undo the damage),
+    # keep every allowance at zero, and price its first site beyond 64 bits;
+    # that position matches the haplotype and never mismatches
+    hap = [0, 1, 1, 0, 1, 0, 0, 1]
+    payload["reads"][0]["observations"] = hap[0:3]
+    payload["reads"][0]["mismatch_costs"] = [1 << 80, 1, 1]
+    payload["reads"][0]["max_mismatches"] = 0
+    # read b2 stays damaged in mismatch_sample; undo it as well so the
+    # instance is damage-free with optimal total cost exactly 0
+    payload["reads"][7]["observations"] = [1, 0]
+    payload["reads"][7]["mismatch_costs"] = [1, 1]
+    payload["reads"][7]["max_mismatches"] = 0
+    return payload
+
+
+def huge_incurred_cost_sample():
+    """Unique phasing whose optimal total cost exceeds uint64 range."""
+    payload = mismatch_sample()
+    huge = 1 << 80
+    # read a0 carries exactly one unavoidable mismatch priced 2**80;
+    # read b2 is repaired so the only optimal cost is the huge one
+    payload["reads"][0]["mismatch_costs"] = [huge, 1, 1]
+    payload["reads"][7]["observations"] = [1, 0]
+    payload["reads"][7]["mismatch_costs"] = [1, 1]
+    payload["reads"][7]["max_mismatches"] = 0
+    return payload, huge
+
+
 # --------------------------------------------------------------------------
 # tiny HTTP client
 # --------------------------------------------------------------------------
@@ -245,11 +276,40 @@ def smoke() -> list[str]:
         check(status == 422, f"status {status}")
         check(body["error"]["code"] == "INVALID_INPUT", f"body {body}")
 
+    def case_huge_unused_cost():
+        status, body = request("POST", "/api/phase", huge_unused_cost_sample())
+        check(status == 200, f"status {status}, body {body}")
+        data = body["data"]
+        check(data["unique"] is True, "should be uniquely solvable")
+        sol = data["solution"]
+        check(sol["haplotype"] == [0, 1, 1, 0, 1, 0, 0, 1], "canonical haplotype")
+        check(sol["total_mismatch_cost"] == 0, f"total cost {sol['total_mismatch_cost']} != 0")
+        check(sol["max_per_read_mismatches"] == 0, "zero mismatches expected")
+        by_id = {r["id"]: r for r in sol["per_read"]}
+        check(by_id["a0"]["mismatch_cost"] == 0, "priced position never mismatches")
+
+    def case_huge_incurred_cost():
+        payload, huge = huge_incurred_cost_sample()
+        status, body = request("POST", "/api/phase", payload)
+        check(status == 200, f"status {status}, body {body}")
+        data = body["data"]
+        check(data["unique"] is True, "should be uniquely solvable")
+        sol = data["solution"]
+        check(sol["haplotype"] == [0, 1, 1, 0, 1, 0, 0, 1], "canonical haplotype")
+        check(sol["total_mismatch_cost"] == huge, "total cost must equal 2**80 exactly")
+        check(sol["total_mismatch_cost"] > 1 << 64, "cost beyond fixed-width integers")
+        check(
+            sum(r["mismatch_cost"] for r in sol["per_read"]) == huge,
+            "per-read costs do not reconcile to the huge total",
+        )
+
     run("mismatch sample (unique, exact evidence)", case_mismatch)
     run("ambiguous sample (two tied solutions)", case_ambiguous)
     run("no-solution business error", case_no_solution)
     run("discontinuous-coverage business error", case_discontinuous)
     run("invalid input rejected", case_invalid)
+    run("huge cost on unused path (zero-cost unique)", case_huge_unused_cost)
+    run("huge cost in optimum beyond 64 bits", case_huge_incurred_cost)
     return failures
 
 
